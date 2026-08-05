@@ -11,6 +11,10 @@ re-weighted skymap, then tiles it with each telescope's field of view to output 
 telescope pointings** — answering *where should we look first to find the
 electromagnetic counterpart?* 
 
+![](teglon_pipeline_version2.png)
+
+
+
 > This is an updated version with a unified `teglon` command-line interface, a Docker
 > wrapper, environment-based configuration. **All original commands still work** — the
 > new commands are shorter equivalents.
