@@ -452,8 +452,9 @@ class Teglon:
         '''
 
         observed_pixel_summary_select = '''
-            SELECT COUNT(*), COALESCE(SUM(hp.Prob), 0.0) 
+            SELECT COUNT(*), COALESCE(SUM(hp.Prob), 0.0), COALESCE(SUM(hpc.NetPixelProb), 0.0) 
             FROM HealpixPixel hp 
+            JOIN HealpixPixel_Completeness hpc on hpc.HealpixPixel_id = hp.id 
             WHERE hp.id IN (
                 SELECT DISTINCT ot_hp.HealpixPixel_id 
                 FROM ObservedTile_HealpixPixel ot_hp 
@@ -461,6 +462,13 @@ class Teglon:
                 WHERE ot_hp.HealpixMap_id = {healpix_map_id} 
                 {source_filter}
             )
+        '''
+
+        map_total_prob_select = '''
+            SELECT COALESCE(SUM(hp.Prob), 0.0), COALESCE(SUM(hpc.NetPixelProb), 0.0) 
+            FROM HealpixPixel hp 
+            JOIN HealpixPixel_Completeness hpc on hpc.HealpixPixel_id = hp.id 
+            WHERE hp.HealpixMap_id = {healpix_map_id}
         '''
 
         planned_source_filter = "AND (ot.Source IS NULL OR ot.Source <> 'TreasureMap-planned')"
@@ -473,6 +481,8 @@ class Teglon:
         healpix_map_id = int(query_db([healpix_map_select % (gw_id, healpix_file)])[0][0][0])
 
         # region Query Builder
+        #
+        tile_cum_prob_cut = cum_prob
         tile_observed_filter = ""
         galaxy_observed_filter = ""
         if exclude_observed:
@@ -486,11 +496,20 @@ class Teglon:
 
             observed_summary = query_db([observed_pixel_summary_select.format(healpix_map_id=healpix_map_id,
                                                                               source_filter=source_filter)])[0][0]
-            _print("Excluding %s already-%s map pixels (2D prob: %0.4f)" %
-                   (int(observed_summary[0]), "imaged/planned" if exclude_planned else "imaged",
-                    float(observed_summary[1])))
+            _print("Excluding %s already-%s map pixels (2D prob: %0.4f, 4D prob: %0.4f)" %
+                    (int(observed_summary[0]), "imaged/planned" if exclude_planned else "imaged",
+                    float(observed_summary[1]), float(observed_summary[2])))
+            # Change so that cum_prob is "of what is left to cover", so that it can always reach the mark, even with many observed tiles
+            map_total = query_db([map_total_prob_select.format(healpix_map_id=healpix_map_id)])[0][0]
+            col = 2 if prob_type == _4D else 1
+            total_prob = float(map_total[col - 1])
+            observed_prob = float(observed_summary[col])
+            if total_prob > 0.0:
+                observed_frac = min(max(observed_prob / total_prob, 0.0), 1.0)
+                tile_cum_prob_cut = cum_prob * (1.0 - observed_frac)
+                _print("%0.4f of the %s probability already covered; cumulative cut %s of the remainder -> %0.4f" % (observed_frac, prob_type, cum_prob, tile_cum_prob_cut))
 
-        tile_where = tile_where_filter.format(box_addendum="", cum_prob=cum_prob,
+        tile_where = tile_where_filter.format(box_addendum="", cum_prob=tile_cum_prob_cut,
                                               f99_coefficient="{f99_coefficient}", extinct="{extinct}")
         galaxy_where = galaxies_where_filter.format(box_addendum="", f99_coefficient="{f99_coefficient}",
                                                     healpix_map_id=healpix_map_id, extinct="{extinct}",
@@ -499,7 +518,7 @@ class Teglon:
         if is_box_query:
             tile_box = tile_box_addendum.format(min_ra=min_ra, max_ra=max_ra,
                                                 min_dec=min_dec, max_dec=max_dec)
-            tile_where = tile_where_filter.format(box_addendum=tile_box, cum_prob=cum_prob,
+            tile_where = tile_where_filter.format(box_addendum=tile_box, cum_prob=tile_cum_prob_cut,
                                                   f99_coefficient="{f99_coefficient}", extinct="{extinct}")
 
             galaxy_box = galaxies_box_addendum.format(min_ra=min_ra, max_ra=max_ra)
@@ -650,6 +669,7 @@ class Teglon:
             comments["EXTINCT_THRESH"] = extinct
             comments["PROB_TYPE"] = prob_type
             comments["CUM_PROB"] = cum_prob
+            comments["CUM_PROB_CUT"] = tile_cum_prob_cut
             comments["NUM_TILES"] = num_tiles
             comments["BOX_QUERY"] = is_box_query
             comments["MIN_RA"] = min_ra
