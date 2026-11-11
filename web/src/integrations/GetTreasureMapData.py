@@ -1,465 +1,191 @@
-import matplotlib
+"""Cron entry point: pull GW events and their pointings from Treasure Map, then plan tiles.
 
-matplotlib.use("Agg")
+    1. Events:    each recent significant event not yet in Teglon -> load_map.py (newest alert's skymap)
+    2. Pointings: every recent event in Teglon -> new Treasure Map pointings loaded as ObservedTiles
+                  (get_TM_pointings.sync_pointings; with --planned, other groups' planned pointings too)
+    3. Plan:      events that are new or whose pointings changed -> `teglon extract` -> `teglon plot`
+                  (with --planned, also `teglon extract --exclude-planned`)
 
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-from mpl_toolkits.basemap import Basemap
-from matplotlib.patches import Polygon
-from matplotlib.pyplot import cm
-from matplotlib.patches import CirclePolygon
-from matplotlib import colors
-from mpl_toolkits.axes_grid1 import make_axes_locatable
+Extract runs after the pointings are loaded, so already-imaged pixels are excluded from the tiles.
 
-import sys
+    python web/src/integrations/GetTreasureMapData.py                   # cron default
+    python web/src/integrations/GetTreasureMapData.py --gw_id S230529ay # one event
+    python web/src/integrations/GetTreasureMapData.py --planned         # also avoid others' planned fields
+    python web/src/integrations/GetTreasureMapData.py --role test --lookback_days 1   # LIGO mock (MS...) events
+"""
 
-sys.path.append('../')
-
+import argparse
+import logging
 import os
-import optparse
-
-from configparser import RawConfigParser
-import multiprocessing as mp
-import mysql.connector
-
-import mysql.connector as test
-
-print(test.__version__)
-
-from mysql.connector.constants import ClientFlag
-from mysql.connector import Error
-import csv
+import subprocess
+import sys
 import time
-import pickle
-from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 
-import numpy as np
-from scipy.special import erf
-from scipy.optimize import minimize, minimize_scalar
-import scipy.stats as st
-from scipy.integrate import simps
-from scipy.interpolate import interp2d
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
-import astropy as aa
-from astropy import cosmology
-from astropy.cosmology import WMAP5, WMAP7, LambdaCDM
-from astropy.coordinates import Distance
-from astropy.coordinates.angles import Angle
-from astropy.cosmology import z_at_value
-from astropy import units as u
-import astropy.coordinates as coord
-from dustmaps.config import config
-from dustmaps.sfd import SFDQuery
+from web.src.utilities.Database_Helpers import query_db  # noqa: E402
+from web.src.utilities.get_TM_pointings import (  # noqa: E402
+    SAFE_ID, latest_map, sync_pointings, tm_get, treasuremap_settings,
+)
 
-import shapely as ss
-from shapely.ops import transform as shapely_transform
-from shapely.geometry import Point
-from shapely.ops import linemerge, unary_union, polygonize, split
-from shapely import geometry
+logger = logging.getLogger("tm_events")
 
-import healpy as hp
-from ligo.skymap import distance
+DEFAULT_TELE = "a"  # all telescopes, same as `teglon run`
 
-from HEALPix_Helpers import *
-from Tile import *
-from SQL_Polygon import *
-from Pixel_Element import *
-from Completeness_Objects import *
 
-import psutil
-import shutil
-import urllib.request
-import requests
-from bs4 import BeautifulSoup
-from dateutil.parser import parse
+def _run(argv):
+    env = dict(os.environ)
+    env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    logger.info("+ %s", " ".join(argv))
+    return subprocess.call(argv, cwd=REPO_ROOT, env=env)
 
-import glob
-import gc
-import json
 
-import MySQLdb as my
+def latest_alerts(endpoint, token, gw_id=None, lookback_days=30, only_with_pointings=False, role="observation"):
+    """{graceid: newest alert} from Treasure Map's query_alerts.
 
-# region config settings
+    `role` is the alert role to ingest: "observation" (real events), "test" (LIGO mock events, MS... ids) or
+    "all". Ignored with `gw_id`, which fetches that event whatever its role."""
+    params = {"api_token": token}
+    if gw_id:
+        params["graceid"] = gw_id
+    else:
+        params["far"] = "Significant"
+        if role != "all":
+            params["role"] = role
+        if lookback_days > 0:
+            since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            params["timesent_after"] = since.strftime("%Y-%m-%dT%H:%M:%S")
+        if only_with_pointings:
+            params["has_pointings"] = "True"
 
-__location__ = os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__)))
-configFile = os.path.join(__location__, 'Settings.ini')
+    latest = {}
+    for alert in tm_get(endpoint, "query_alerts", params):
+        graceid = alert.get("graceid")
+        if not graceid:
+            continue
+        sent = str(alert.get("timesent") or alert.get("datecreated") or "")  # ISO strings sort correctly
+        if graceid not in latest or sent >= latest[graceid][0]:
+            latest[graceid] = (sent, alert)
+    return {g: a for g, (_, a) in latest.items()}
 
-db_config = RawConfigParser()
-db_config.read(configFile)
 
-db_name = db_config.get('database', 'DATABASE_NAME')
-db_user = db_config.get('database', 'DATABASE_USER')
-db_pwd = db_config.get('database', 'DATABASE_PASSWORD')
-db_host = db_config.get('database', 'DATABASE_HOST')
-db_port = db_config.get('database', 'DATABASE_PORT')
+def ingest_event(gw_id, alert):
+    """load_map for one event. Returns True on success."""
+    load_map = [sys.executable, os.path.join("web", "src", "ingestion", "load_map.py"), "--gw_id", gw_id]
+    url = alert.get("skymap_fits_url")
+    if url:
+        # load_map downloads the file from GraceDB by name.
+        load_map += ["--healpix_file", url.rstrip("/").split("/")[-1]]
+    if _run(load_map) != 0:
+        logger.error("%s: load_map failed.", gw_id)
+        return False
 
-# Set up dustmaps config
-config["data_dir"] = "./"
+    if latest_map(gw_id)[0] is None:
+        logger.error("%s: load_map reported success but no HealpixMap row exists.", gw_id)
+        return False
+    return True
 
-cosmo = LambdaCDM(H0=70, Om0=0.3, Ode0=0.7)
 
-# endregion
+def plan_event(gw_id, planned=False):
+    """extract -> plot on the event's latest map (plus an --exclude-planned extract). Returns True on success."""
+    # Use the filename load_map actually stored, so extract/plot find the right map.
+    map_id, healpix_file = latest_map(gw_id)
+    if map_id is None:
+        logger.error("%s: no map loaded; can't extract tiles.", gw_id)
+        return False
 
-# region database methods
+    for stage in ("extract", "plot"):
+        rc = _run([sys.executable, "-m", "web.src.services.teglon_cli", stage, gw_id,
+                   "--healpix-file", healpix_file, "--tele", DEFAULT_TELE])
+        if rc != 0:
+            logger.error("%s: teglon %s failed (rc=%s).", gw_id, stage, rc)
+            return False
 
-def bulk_upload(query):
-    success = False
+    if planned:
+        rc = _run([sys.executable, "-m", "web.src.services.teglon_cli", "extract", gw_id,
+                   "--healpix-file", healpix_file, "--tele", DEFAULT_TELE, "--exclude-planned"])
+        if rc != 0:
+            logger.error("%s: teglon extract --exclude-planned failed (rc=%s).", gw_id, rc)
+            return False
+    return True
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Ingest Treasure Map events and pointings into Teglon.")
+    parser.add_argument("--gw_id", default="", help="Only this event. Default: all recent significant events.")
+    parser.add_argument("--lookback_days", type=int, default=30,
+                        help="Alerts/events from the last N days (0 = all). Default: 30")
+    parser.add_argument("--only_with_pointings", action="store_true",
+                        help="Only ingest events that already have Treasure Map pointings.")
+    parser.add_argument("--skip_pointings", action="store_true", help="Ingest events only.")
+    parser.add_argument("--role", default="observation", choices=["observation", "test", "all"],
+                        help="Alert role to ingest: real events (observation), LIGO mock MS... events (test), "
+                             "or both. Mock alerts are frequent, so pair `test` with a short --lookback_days. "
+                             "Ignored with --gw_id. Default: observation")
+    parser.add_argument("--planned", action="store_true",
+                        help="Also load other groups' planned pointings and extract tiles that avoid them "
+                             "(*_exclplanned.txt). Clear them with `teglon clear-planned <GWID>`.")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    start = time.time()
+
+    token, endpoint = treasuremap_settings()
+    if not token:
+        logger.error("No Treasure Map API token (TM_API_TOKEN env var or [treasuremap] in Settings.ini).")
+        return 1
+
+    rc = 0
     try:
-
-        conn = mysql.connector.connect(user=db_user, password=db_pwd, host=db_host, port=db_port, database=db_name)
-        cursor = conn.cursor()
-        cursor.execute(query)
-        conn.commit()
-        success = True
-
-    except Error as e:
-        print("Error in uploading CSV!")
-        print(e)
-    finally:
-        cursor.close()
-        conn.close()
-
-    return success
-
-def query_db(query_list, commit=False):
-    # query_string = ";".join(query_list)
-
-    results = []
-    try:
-        chunk_size = 1e+6
-
-        db = my.connect(host=db_host, user=db_user, passwd=db_pwd, db=db_name, port=3306)
-        cursor = db.cursor()
-
-        for q in query_list:
-            cursor.execute(q)
-
-            if commit:  # used for updates, etc
-                db.commit()
-
-            streamed_results = []
-            print("fetching results...")
-            while True:
-                r = cursor.fetchmany(1000000)
-                count = len(r)
-                streamed_results += r
-                size_in_mb = sys.getsizeof(streamed_results) / 1.0e+6
-
-                print("\tfetched: %s; current length: %s; running size: %0.3f MB" % (
-                count, len(streamed_results), size_in_mb))
-
-                if not r or count < chunk_size:
-                    break
-
-        results.append(streamed_results)
-
-    # cnx = mysql.connector.connect(user=db_user, password=db_pwd, host=db_host, port=db_port, database=db_name)
-    # cursor = cnx.cursor()
-    # for result in cursor.execute(query_string, multi=True):
-
-    # 	streamed_results = []
-    # 	print("fetching results...")
-
-    # 	i = 0
-    # 	while True:
-    # 		i += chunk_size
-    # 		print("Fetching: %s records" % i)
-
-    # 		partial_result = result.fetchmany(chunk_size)
-    # 		count = len(partial_result)
-    # 		streamed_results += partial_result
-    # 		size_in_mb = sys.getsizeof(streamed_results)/1.0e+6
-
-    # 		print("\tfetched: %s; current length: %s; running size: %0.3f MB" % (count, len(streamed_results), size_in_mb))
-
-    # 		if not partial_result or count < chunk_size:
-    # 			break
-
-    # 	results.append(streamed_results)
-
-    except Error as e:
-        print('Error:', e)
-    finally:
-        cursor.close()
-        # cnx.close()
-        db.close()
-
-    # fake = [[[(1)]]]
-    return results
-
-def batch_query(query_list):
-    return_data = []
-    batch_size = 500
-    ii = 0
-    jj = batch_size
-    kk = len(query_list)
-
-    print("\nLength of data to query: %s" % kk)
-    print("Query batch size: %s" % batch_size)
-    print("Starting loop...")
-
-    number_of_queries = len(query_list) // batch_size
-    if len(query_list) % batch_size > 0:
-        number_of_queries += 1
-
-    query_num = 1
-    payload = []
-    while jj < kk:
-        t1 = time.time()
-
-        print("%s:%s" % (ii, jj))
-        payload = query_list[ii:jj]
-        return_data += query_db(payload)
-
-        ii = jj
-        jj += batch_size
-        t2 = time.time()
-
-        print("\n********* start DEBUG ***********")
-        print("Query %s/%s complete - execution time: %s" % (query_num, number_of_queries, (t2 - t1)))
-        print("********* end DEBUG ***********\n")
-
-        query_num += 1
-
-    print("Out of loop...")
-
-    t1 = time.time()
-
-    print("\n%s:%s" % (ii, kk))
-
-    payload = query_list[ii:kk]
-    return_data += query_db(payload)
-
-    t2 = time.time()
-
-    print("\n********* start DEBUG ***********")
-    print("Query %s/%s complete - execution time: %s" % (query_num, number_of_queries, (t2 - t1)))
-    print("********* end DEBUG ***********\n")
-
-    return return_data
-
-def insert_records(query, data):
-    _tstart = time.time()
-    success = False
-    try:
-        conn = mysql.connector.connect(user=db_user, password=db_pwd, host=db_host, port=db_port, database=db_name)
-        cursor = conn.cursor()
-        cursor.executemany(query, data)
-
-        conn.commit()
-        success = True
-    except Error as e:
-        print('Error:', e)
-    finally:
-        cursor.close()
-        conn.close()
-
-    _tend = time.time()
-    print("\n********* start DEBUG ***********")
-    print("insert_records execution time: %s" % (_tend - _tstart))
-    print("********* end DEBUG ***********\n")
-    return success
-
-def batch_insert(insert_statement, insert_data, batch_size=50000):
-    _tstart = time.time()
-
-    i = 0
-    j = batch_size
-    k = len(insert_data)
-
-    print("\nLength of data to insert: %s" % len(insert_data))
-    print("Insert batch size: %s" % batch_size)
-    print("Starting loop...")
-
-    number_of_inserts = len(insert_data) // batch_size
-    if len(insert_data) % batch_size > 0:
-        number_of_inserts += 1
-
-    insert_num = 1
-    payload = []
-    while j < k:
-        t1 = time.time()
-
-        print("%s:%s" % (i, j))
-        payload = insert_data[i:j]
-
-        if insert_records(insert_statement, payload):
-            i = j
-            j += batch_size
-        else:
-            raise ("Error inserting batch! Exiting...")
-
-        t2 = time.time()
-
-        print("\n********* start DEBUG ***********")
-        print("INSERT %s/%s complete - execution time: %s" % (insert_num, number_of_inserts, (t2 - t1)))
-        print("********* end DEBUG ***********\n")
-
-        insert_num += 1
-
-    print("Out of loop...")
-
-    t1 = time.time()
-
-    print("\n%s:%s" % (i, k))
-
-    payload = insert_data[i:k]
-    if not insert_records(insert_statement, payload):
-        raise ("Error inserting batch! Exiting...")
-
-    t2 = time.time()
-
-    print("\n********* start DEBUG ***********")
-    print("INSERT %s/%s complete - execution time: %s" % (insert_num, number_of_inserts, (t2 - t1)))
-    print("********* end DEBUG ***********\n")
-
-    _tend = time.time()
-
-    print("\n********* start DEBUG ***********")
-    print("batch_insert execution time: %s" % (_tend - _tstart))
-    print("********* end DEBUG ***********\n")
-
-# endregion
-
-class Teglon:
-
-    def add_options(self, parser=None, usage=None, config=None):
-        import optparse
-        if parser == None:
-            parser = optparse.OptionParser(usage=usage, conflict_handler="resolve")
-
-        parser.add_option('--gw_id', default="", type="str",
-                          help='LIGO superevent name, e.g. `S190425z` ')
-
-        # parser.add_option('--orig_res', action="store_true", default=False,
-        #                   help='''Upload the healpix file at the native resolution (Default = False)''')
-        #
-        # parser.add_option('--load_local_file', action="store_true", default=False,
-        #                   help='''Circumvent downloading map and load map from disk (Default = False)''')
-
-        return (parser)
-
-    def main(self):
-
-        api_token = "jOwrpZgnXU-nLVi7r8bhL2wliAI0ZXi5IZUudQ"
-        base_url = 'http://treasuremap.space/api/v0'
-        #
-        # # get all photometric instruments
-        # instrument_url = 'instruments'
-        # instrument_synopsis_request = {
-        #     "api_token": api_token,
-        #     "type": "photometric"
-        # }
-        # instrument_list_target_url = "{}/{}?{}".format(base_url, instrument_url,
-        #                                                urllib.parse.urlencode(instrument_synopsis_request))
-        # instrument_response = requests.get(url=instrument_list_target_url)
-        # instrument_result = [json.loads(r) for r in json.loads(instrument_response.text)]
-        # instruments = {ir["id"]:ir["instrument_name"] for ir in instrument_result}
-        # print("instruments:")
-        # for id, name in instruments.items():
-        #     print("{}:{}".format(name, id))
-        #
-        # get details for all instruments
-        # footprint_url = 'footprints'
-        # instrument_detail_request = {
-        #     "api_token": api_token,
-        #     # "ids": "[{}]".format(",".join([str(id) for id, name in instruments.items()]))
-        # }
-        # instrument_detail_target_url = "{}/{}?{}".format(base_url, footprint_url,
-        #                                                urllib.parse.urlencode(instrument_detail_request))
-        # instrument_detail_response = requests.get(url=instrument_detail_target_url)
-        # instrument_detail_result = [json.loads(r) for r in json.loads(instrument_detail_response.text)]
-        #
-        # instrument_footprints = {}
-        # for idr in instrument_detail_result:
-        #
-        #     if idr["instrumentid"] not in instrument_footprints:
-        #         instrument_footprints[idr["instrumentid"]] = []
-        #
-        #     instrument_footprints[idr["instrumentid"]].append(idr["footprint"])
-        #
-        # # instrument_footprints = {idr["instrumentid"]:idr["footprint"] for idr in  instrument_detail_result}
-        #
-        # [print(p) for p in instrument_footprints[47]]
-        #
-        # test = 1
-
-        pointing_url = 'pointings'
-        pointing_request = {
-            "api_token": api_token,
-            "status": "completed",
-            # "bands": [
-            #     "U", "B", "V", "g", "r", "i"
-            # ],
-            "graceid": "GW190425"
-        }
-        pointing_target_url = "{}/{}?{}".format(base_url, pointing_url,
-                                                         urllib.parse.urlencode(pointing_request))
-        pointing_response = requests.get(url=pointing_target_url)
-        pointing_result = [json.loads(r) for r in json.loads(pointing_response.text)]
-        test = 1
-
-
-
-
-        # t = Tile(359.85, 0.0, 0.49493333333333334, 0.4968666666666667, 1024)
-        # # test1 = t.query_polygon_string
-        # # test = 1
-        #
-        # t2 = Tile(359.8, 0.0, 0.49493333333333334, 0.4968666666666667, 1024)
-        #
-        # fig = plt.figure(figsize=(10, 10), dpi=800)
-        # ax = fig.add_subplot(111)
-        # m = Basemap(projection='ortho', lon_0=0.0, lat_0=0.0)
-        # m.drawparallels(np.arange(-90., 120., 30.))
-        # m.drawmeridians(np.arange(0., 420., 60.))
-        #
-        # t.plot(m, ax, edgecolor='blue', facecolor='None', linewidth=0.25, alpha=1.0,
-        #        zorder=9900)
-        # t2.plot(m, ax, edgecolor='red', facecolor='None', linewidth=0.25, alpha=1.0,
-        #        zorder=9900)
-        #
-        # fig.savefig("test_tile.png", bbox_inches='tight')  # ,dpi=840
-        # plt.close('all')
-
-
-        # json_data = {
-        #     "graceid": self.options.gw_id,
-        #     "api_token": tm_api_key,
-        #     "pointings": self.pointings
-        # }
-
-        # instruments_ids = {
-        #     "ZTF":47,
-        #
-        #
-        # }
-        #
-        # json_data = {
-        #     "graceid": self.options.gw_id,
-        #     "api_token": tm_api_key,
-        #     "pointings": self.pointings
-        # }
-
-
-        # pass
+        alerts = latest_alerts(endpoint, token, args.gw_id or None, args.lookback_days,
+                               args.only_with_pointings, args.role)
+    except Exception as e:
+        logger.error("Treasure Map query_alerts failed: %s", e)
+        alerts, rc = {}, 1
+
+    res = query_db(["SELECT DISTINCT GWID FROM HealpixMap;"])
+    archived = {r[0] for r in (res[0] if res else [])}
+
+    new, failed = [], []
+    for gw_id in sorted(alerts):
+        alert = alerts[gw_id]
+        if not SAFE_ID.match(gw_id):
+            logger.warning("Skipping unexpected graceid %r", gw_id)
+            continue
+        if str(alert.get("alert_type", "")).lower() == "retraction":
+            logger.info("%s: retracted; skipping.", gw_id)
+            continue
+        if gw_id in archived:
+            continue
+        logger.info("%s: new event, ingesting.", gw_id)
+        (new if ingest_event(gw_id, alert) else failed).append(gw_id)
+
+    logger.info("Events: %d alerts, %d new ingested %s, %d failed %s.",
+                len(alerts), len(new), new, len(failed), failed)
+    logger.info("Event ingestion took %.1fs.", time.time() - start)
+
+    updated = set()
+    if not args.skip_pointings:
+        t = time.time()
+        grace_ids = [args.gw_id] if args.gw_id else None
+        if sync_pointings(grace_ids, args.lookback_days, updated=updated) != 0:
+            rc = 1
+        if args.planned and sync_pointings(grace_ids, args.lookback_days, status="planned", updated=updated) != 0:
+            rc = 1
+        logger.info("Pointing sync took %.1fs.", time.time() - t)
+
+    # Plan after the pointings are in, so the tiles skip what's already been imaged.
+    to_plan = sorted(set(new) | updated)
+    plan_failed = [g for g in to_plan if not plan_event(g, planned=args.planned)]
+    logger.info("Planned %d event(s) %s, %d failed %s.", len(to_plan), to_plan, len(plan_failed), plan_failed)
+
+    return 1 if (rc or failed or plan_failed) else 0
 
 
 if __name__ == "__main__":
-    useagestring = """python GetTreasureMapData.py [options]
-
-"""
-
-    start = time.time()
-
-    teglon = Teglon()
-    parser = teglon.add_options(usage=useagestring)
-    options, args = parser.parse_args()
-    teglon.options = options
-    teglon.main()
-
-    end = time.time()
-    duration = (end - start)
-    print("\n********* start DEBUG ***********")
-    print("Teglon `GetTreasureMapData` execution time: %s" % duration)
-    print("********* end DEBUG ***********\n")
+    sys.exit(main())

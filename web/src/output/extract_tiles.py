@@ -46,6 +46,9 @@ if __name__ == "__main__":
                       help='''Optional, decimal format. Must be If specified, `min_ra`, `max_ra`, `min_dec`,
                       and `max_dec` are all required. `min_dec` must be >= -90.0 and < `max_dec`. Within the defined
                       box, tiles will be extracted within a given telescope's declination limits.''')
+    parser.add_argument('--include_observed', dest='exclude_observed', action='store_false', default=True,
+                      help='''Optional. Keep map pixels already covered by ingested pointings (ObservedTile). By
+                      default they are excluded so suggested pointings only cover un-imaged sky.''')
 
     args = parser.parse_args()
     teglon.extract_tiles(**vars(args))

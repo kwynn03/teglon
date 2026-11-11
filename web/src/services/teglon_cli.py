@@ -8,6 +8,8 @@ A single front door for the whole pipeline so you no longer have to run
     teglon extract S230529ay
     teglon plot S230529ay
     teglon load-obs S230529ay --tile-file my_obs.ecsv
+    teglon sync-pointings S230529ay # load Treasure Map pointings (completed by default)
+    teglon tm-ingest --gw-id S230529ay  # Treasure Map: new event -> pointings -> extract -> plot
     teglon efficiency S230529ay --model-type kne
     teglon bootstrap                # build a fresh DB (dust + GLADE + detectors + grids)
 
@@ -150,6 +152,31 @@ def normalize_geometry_args(geometry, width=None, height=None, radius=None):
         return {"detector_geometry": None, "detector_width": None,
                 "detector_height": None, "detector_radius": None}
     raise ValueError("Unknown geometry: %r (use rectangle, circle, or polygon)" % geometry)
+
+
+def grid_prefix_from_field_name(field_name):
+    """The static-grid prefix of a StaticTile FieldName (`<prefix><6-digit index>`), e.g. `T80S000123` -> `T80S`."""
+    return str(field_name).rstrip("0123456789")
+
+
+def choose_grid_prefix(detector_name, existing_prefixes):
+    """Pick a static-grid FieldName prefix for `detector_name` that no other detector uses.
+
+    Tries the name's first letter, then its first two letters, and so on (alphanumerics only, upper-cased).
+    Candidates ending in a digit are skipped so the prefix can't run into the 6-digit field index
+    (`T80S_T80S-Cam` -> `T`, then `T80S`). If every candidate is taken, a number is appended to the
+    full name. Comparison is case-insensitive. Pure."""
+    letters = "".join(ch for ch in str(detector_name).upper() if ch.isalnum()) or "T"
+    taken = {str(p).upper() for p in existing_prefixes}
+    for n in range(1, len(letters) + 1):
+        candidate = letters[:n]
+        if candidate[-1].isalpha() and candidate not in taken:
+            return candidate
+    k = 2
+    while "%s%dX" % (letters, k) in taken:
+        k += 1
+    # Trailing letter keeps the prefix from merging with the field index.
+    return "%s%dX" % (letters, k)
 
 
 def build_setup_steps(skip_glade=False, skip_init=False, skip_pickles=False, is_debug=True):
@@ -299,11 +326,15 @@ def cmd_extract(args):
             max_ra=args.max_ra,
             min_dec=args.min_dec,
             max_dec=args.max_dec,
+            exclude_observed=args.exclude_observed,
+            exclude_planned=args.exclude_planned,
         )
     if getattr(args, "json", False):
         import glob
         d = event_dir(args.gw_id, args.healpix_dir)
         box = "_box" if all(v != -1 for v in (args.min_ra, args.max_ra, args.min_dec, args.max_dec)) else ""
+        if args.exclude_observed and args.exclude_planned:
+            box += "_exclplanned"
         pattern = os.path.join(d, "%s_*_%s_%s_%s%s.txt" % (
             args.gw_id, args.prob_type, args.cum_prob, args.healpix_file, box))
         out = {"gw_id": args.gw_id, "prob_type": args.prob_type,
@@ -380,13 +411,22 @@ def cmd_run(args):
 
 # --- wrappers around standalone scripts --------------------------------------
 def cmd_load_obs(args):
+    if not args.tile_file and not args.tm_instrument:
+        logger.error("load-obs needs either --tile-file or --tm-instrument.")
+        return 2
     extra = [
         "--gw_id", args.gw_id,
         "--healpix_file", args.healpix_file,
         "--healpix_dir", args.healpix_dir,
         "--tile_dir", args.tile_dir,
-        "--tile_file", args.tile_file,
     ]
+    if args.tile_file:
+        extra += ["--tile_file", args.tile_file]
+    # Treasure Map mode. The API token is read by the loader from TM_API_TOKEN, never passed on argv.
+    if args.tm_instrument:
+        extra += ["--tm_instrument", args.tm_instrument, "--tm_status", args.tm_status]
+    if args.detector_name:
+        extra += ["--detector_name", args.detector_name]
     return _run_script(os.path.join("web", "src", "ingestion", "load_observed_tiles.py"), extra)
 
 
@@ -556,6 +596,36 @@ def cmd_bootstrap(args):
 
 
 # --- new feature commands ----------------------------------------------------
+def cmd_sync_pointings(args):
+    """Load Treasure Map pointings for events into ObservedTile (get_TM_pointings.sync_pointings)."""
+    from web.src.utilities.get_TM_pointings import sync_pointings
+    return sync_pointings(args.gw_ids or None, args.lookback_days, args.status)
+
+
+def cmd_tm_ingest(args):
+    """Treasure Map cron flow (GetTreasureMapData.main): new events -> pointings -> extract -> plot."""
+    from web.src.integrations.GetTreasureMapData import main as tm_ingest_main
+    argv = ["--lookback_days", str(args.lookback_days)]
+    if args.gw_id:
+        argv += ["--gw_id", args.gw_id]
+    if args.only_with_pointings:
+        argv.append("--only_with_pointings")
+    if args.skip_pointings:
+        argv.append("--skip_pointings")
+    if args.planned:
+        argv.append("--planned")
+    if args.role != "observation":
+        argv += ["--role", args.role]
+    return tm_ingest_main(argv)
+
+
+def cmd_clear_planned(args):
+    from web.src.utilities.get_TM_pointings import clear_planned
+    n = clear_planned(args.gw_id, args.healpix_file)
+    _banner("Cleared %d planned pointing(s) for %s." % (n, args.gw_id))
+    return 0
+
+
 def cmd_delete_event(args):
     """Clean a GW event from the DB and/or the filesystem. DRY-RUN by default:
     nothing is removed unless --yes is given."""
@@ -616,13 +686,79 @@ def cmd_add_telescope(args):
     t.add_detector(tm_detector_id=args.tm_detector_id, min_dec=args.min_dec,
                    max_dec=args.max_dec, **geo)
 
-    if args.teglon_detector_id is not None and args.prefix is not None:
-        _banner("Building static grid for Teglon detector id=%s ..." % args.teglon_detector_id)
-        t.add_static_grid(teglon_detector_id=args.teglon_detector_id, detector_prefix=args.prefix)
+    from web.src.utilities.Database_Helpers import query_db
+    if args.teglon_detector_id is not None:
+        rows = query_db(["SELECT id, Name FROM Detector WHERE id = %d;" % args.teglon_detector_id])[0]
     else:
-        logger.info("\nDetector added. To build its static tile grid, re-run with "
-              "--teglon-detector-id <DB id> --prefix <letter> (the DB id is the new "
-              "Detector.id; check it with `./teglon dbshell`).")
+        # add_detector doesn't return the new id; find it by its Treasure Map id (also covers a re-run
+        # where the detector already existed).
+        rows = query_db(["SELECT id, Name FROM Detector WHERE TM_id = %d ORDER BY id;" % args.tm_detector_id])[0]
+    if len(rows) == 0:
+        logger.error("Detector not found (TM_id=%s, id=%s); can't build its static grid."
+                     % (args.tm_detector_id, args.teglon_detector_id))
+        return 1
+    detector_id, detector_name = int(rows[0][0]), rows[0][1]
+
+    n_tiles = int(query_db(["SELECT COUNT(*) FROM StaticTile WHERE Detector_id = %d;" % detector_id])[0][0][0])
+
+    if args.no_grid:
+        logger.info("\nDetector added without a static grid (--no-grid); `extract` won't produce tiles for it "
+                    "until you re-run without --no-grid.")
+        return 0
+
+    if n_tiles > 0:
+        logger.info("Detector id=%s already has a static grid (%d tiles); not building another." %
+                    (detector_id, n_tiles))
+        return 0
+
+    # Prefixes already used by other detectors' grids (one sample FieldName per detector is enough).
+    existing = {grid_prefix_from_field_name(r[1]): r[0] for r in query_db(
+        ["SELECT Detector_id, MIN(FieldName) FROM StaticTile GROUP BY Detector_id;"])[0]}
+    prefix = args.prefix
+    if prefix is None:
+        prefix = choose_grid_prefix(detector_name, existing)
+        logger.info("Using static-grid prefix `%s` for %s (taken: %s)." %
+                    (prefix, detector_name, ", ".join(sorted(existing)) or "none"))
+    elif prefix.upper() in {p.upper() for p in existing}:
+        logger.error("Prefix `%s` is already used by another detector's grid; pick another or omit --prefix "
+                     "to choose one automatically." % prefix)
+        return 1
+
+    _banner("Building static grid for %s (Teglon detector id=%s, prefix `%s`) ..." % (detector_name, detector_id, prefix))
+    t.add_static_grid(teglon_detector_id=detector_id, detector_prefix=prefix)
+    logger.info("\nStatic grid built. Maps loaded before now have no tiles for this detector; reload them "
+                "with `teglon load-map <GWID> --healpix-file <file>` (clobbers by default).")
+    return 0
+
+
+def cmd_list_telescopes(args):
+    """List registered telescopes/detectors: Treasure Map id, dec limits, and static-grid size
+    (a detector with 0 static tiles gets no `extract` output)."""
+    from web.src.utilities.Database_Helpers import query_db
+    res = query_db(["""
+        SELECT d.id, d.Name, d.TM_id, d.MinDec, d.MaxDec, COUNT(st.id) AS static_tiles
+        FROM Detector d
+        LEFT JOIN StaticTile st ON st.Detector_id = d.id
+        GROUP BY d.id, d.Name, d.TM_id, d.MinDec, d.MaxDec
+        ORDER BY d.id;
+    """])
+    if not res:
+        logger.error("Could not query the Detector table (is the database up? `./teglon up`).")
+        return 1
+
+    detectors = [{"id": int(r[0]), "name": r[1], "tm_id": None if r[2] is None else int(r[2]),
+                  "min_dec": float(r[3]), "max_dec": float(r[4]), "static_tiles": int(r[5])} for r in res[0]]
+    if args.json:
+        _emit(json.dumps({"detectors": detectors}))
+        return 0
+
+    _emit("%-5s %-32s %-7s %16s %13s" % ("ID", "NAME", "TM_ID", "DEC RANGE", "STATIC_TILES"))
+    for d in detectors:
+        _emit("%-5s %-32s %-7s %16s %13s%s" % (
+            d["id"], d["name"], "-" if d["tm_id"] is None else d["tm_id"],
+            "%.1f..%.1f" % (d["min_dec"], d["max_dec"]), d["static_tiles"],
+            "" if d["static_tiles"] or d["tm_id"] is None
+            else "  (no grid: re-run add-telescope --tm-detector-id %s)" % d["tm_id"]))
     return 0
 
 
@@ -847,6 +983,11 @@ def build_parser():
     p.add_argument("--max-ra", dest="max_ra", type=float, default=-1.0)
     p.add_argument("--min-dec", dest="min_dec", type=float, default=-1.0)
     p.add_argument("--max-dec", dest="max_dec", type=float, default=-1.0)
+    p.add_argument("--include-observed", dest="exclude_observed", action="store_false", default=True,
+                   help="Keep map pixels already covered by ingested pointings (excluded by default).")
+    p.add_argument("--exclude-planned", dest="exclude_planned", action="store_true",
+                   help="Also skip pixels covered by planned Treasure Map pointings (other groups' plans). "
+                        "Writes *_exclplanned.txt so the completed-only tiles are kept.")
     p.add_argument("--json", action="store_true", help="Emit a JSON summary of the tile files.")
     p.set_defaults(func=cmd_extract)
 
@@ -866,8 +1007,15 @@ def build_parser():
     p = sub.add_parser("load-obs", help="Ingest community/observed tiles into the DB")
     _add_common_event_args(p)
     p.add_argument("--tile-dir", dest="tile_dir", default="./web/events/{GWID}/observed_tiles")
-    p.add_argument("--tile-file", dest="tile_file", required=True,
-                   help="File of observed tiles to import.")
+    p.add_argument("--tile-file", dest="tile_file", default="",
+                   help="File of observed tiles to import (or use --tm-instrument).")
+    p.add_argument("--tm-instrument", dest="tm_instrument", default="",
+                   help="Treasure Map instrument id/name: pull pointings from Treasure Map instead of a file. "
+                        "Reads the token from the TM_API_TOKEN env var.")
+    p.add_argument("--tm-status", dest="tm_status", default="completed", choices=["completed", "planned"],
+                   help="Planned pointings are tagged so they can be cleared with `clear-planned`.")
+    p.add_argument("--detector-name", dest="detector_name", default="",
+                   help="Teglon Detector.Name to load the pointings under.")
     p.set_defaults(func=cmd_load_obs)
 
     # efficiency
@@ -914,6 +1062,42 @@ def build_parser():
     p.add_argument("--skip-galaxies", dest="skip_galaxies", action="store_true")
     p.set_defaults(func=cmd_bootstrap)
 
+    # sync-pointings
+    p = sub.add_parser("sync-pointings",
+                       help="Load Treasure Map pointings for events (only new ones; per event's latest map)")
+    p.add_argument("gw_ids", nargs="*", metavar="gw_id",
+                   help="Event(s) to sync. Default: every event in the DB within --lookback-days.")
+    p.add_argument("--lookback-days", dest="lookback_days", type=int, default=30,
+                   help="With no gw_id: only events from the last N days (0 = all). Default: 30")
+    p.add_argument("--status", default="completed", choices=["completed", "planned"],
+                   help="Planned pointings are tagged so `extract --exclude-planned` can use them and "
+                        "`clear-planned` can remove them. Default: completed")
+    p.set_defaults(func=cmd_sync_pointings)
+
+    # tm-ingest
+    p = sub.add_parser("tm-ingest",
+                       help="Treasure Map flow: load new events, sync pointings, then extract + plot changed events")
+    p.add_argument("--gw-id", dest="gw_id", default="",
+                   help="Only this event. Default: all recent significant events.")
+    p.add_argument("--lookback-days", dest="lookback_days", type=int, default=30,
+                   help="Alerts/events from the last N days (0 = all). Default: 30")
+    p.add_argument("--only-with-pointings", dest="only_with_pointings", action="store_true",
+                   help="Only ingest events that already have Treasure Map pointings.")
+    p.add_argument("--skip-pointings", dest="skip_pointings", action="store_true", help="Ingest events only.")
+    p.add_argument("--role", default="observation", choices=["observation", "test", "all"],
+                   help="Alert role: real events (observation), LIGO mock MS... events (test), or both. Mock "
+                        "alerts are frequent, so pair `test` with a short --lookback-days. Ignored with --gw-id.")
+    p.add_argument("--planned", action="store_true",
+                   help="Also load planned pointings and extract tiles that avoid them (*_exclplanned.txt).")
+    p.set_defaults(func=cmd_tm_ingest)
+
+    # clear-planned
+    p = sub.add_parser("clear-planned", help="Remove an event's planned Treasure Map pointings from the DB")
+    p.add_argument("gw_id", help="LIGO superevent name, e.g. S230529ay")
+    p.add_argument("--healpix-file", dest="healpix_file", default=None,
+                   help="Only this map's planned pointings. Default: all of the event's maps.")
+    p.set_defaults(func=cmd_clear_planned)
+
     # delete-event
     p = sub.add_parser("delete-event",
                        help="Clean a GW event from the DB and files (dry-run unless --yes)")
@@ -935,9 +1119,18 @@ def build_parser():
     p.add_argument("--min-dec", dest="min_dec", type=float, default=-90.0)
     p.add_argument("--max-dec", dest="max_dec", type=float, default=90.0)
     p.add_argument("--teglon-detector-id", dest="teglon_detector_id", type=int, default=None,
-                   help="DB Detector.id of the new detector; if given with --prefix, also build its static grid.")
-    p.add_argument("--prefix", default=None, help="Field-name prefix for the static grid (e.g. 'L').")
+                   help="Override: DB Detector.id to build the grid for. Default: looked up by --tm-detector-id.")
+    p.add_argument("--prefix", default=None,
+                   help="Field-name prefix for the static grid (e.g. 'L'). Default: chosen automatically from "
+                        "the detector name (first letter, then first two, ...) so it's unique.")
+    p.add_argument("--no-grid", dest="no_grid", action="store_true",
+                   help="Only register the detector; don't build its static grid (extract needs the grid).")
     p.set_defaults(func=cmd_add_telescope)
+
+    # list-telescopes
+    p = sub.add_parser("list-telescopes", help="List registered telescopes, their Treasure Map ids and grid sizes")
+    p.add_argument("--json", action="store_true", help="Emit the detectors as JSON.")
+    p.set_defaults(func=cmd_list_telescopes)
 
     # setup
     p = sub.add_parser("setup", help="One-time complete initialization (dry-run unless --run)")

@@ -11,6 +11,7 @@
 #   ./teglon --help                   # list all subcommands
 #   ./teglon down                     # stop the stack
 #   ./teglon logs                     # follow database logs
+#   ./teglon test                     # run the unit tests inside the image (extra args go to unittest)
 #
 set -euo pipefail
 
@@ -58,6 +59,13 @@ case "${cmd}" in
   logs)
     shift || true
     dc logs -f gw_db "$@"
+    ;;
+  test)
+    # Unit tests in the production image. They don't use the DB,
+    # but the teglon_cli service depends on it, so compose starts gw_db if it isn't running.
+    shift || true
+    if [[ $# -eq 0 ]]; then set -- -v; fi
+    dc run --rm -T --entrypoint python teglon_cli -m unittest discover -s tests "$@"
     ;;
   dbshell)
     # Open a MySQL shell inside the network (no host port needed).

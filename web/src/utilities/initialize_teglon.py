@@ -41,6 +41,7 @@ from astropy import units as u
 import astropy.coordinates as coord
 from dustmaps.config import config as dustmaps_config
 import dustmaps.sfd
+from web.src.utilities.fetch_sfd import fetch_sfd
 
 import shapely as ss
 from shapely.ops import transform as shapely_transform
@@ -204,7 +205,7 @@ class Teglon:
 
         # Set up dustmaps config
         dustmaps_config["data_dir"] = "/dustmaps"
-        dustmaps.sfd.fetch()
+        fetch_sfd(dustmaps_config["data_dir"])
 
         print("Initializing database named: %s" % db_name)
 

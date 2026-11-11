@@ -79,6 +79,25 @@ def initialize_tile(tile):
     return tile
 
 
+def read_skymap(path):
+    """Read a HEALPix skymap as ((prob, distmu, distsigma, distnorm), header) in RING ordering.
+
+    Multi-order (NUNIQ) maps such as `bayestar.multiorder.fits` -- what O4 alerts link to -- can't be read by
+    healpy.read_map; they're flattened with ligo.skymap at their finest resolution (load_map then rescales to
+    NSIDE 256 unless in analysis mode). `header` is the FITS header's (key, value) pairs either way."""
+    with fits.open(path) as hdul:
+        hdr = hdul[1].header
+        is_multiorder = str(hdr.get("ORDERING", "")).strip().upper() == "NUNIQ"
+        header = list(hdr.items())
+    if not is_multiorder:
+        return hp.read_map(path, field=(0, 1, 2, 3), h=True)
+
+    from ligo.skymap.io import read_sky_map
+    _print("`%s` is a multi-order map; flattening it with ligo.skymap..." % os.path.basename(path))
+    (prob, distmu, distsigma, distnorm), _ = read_sky_map(path, nest=False, distances=True)
+    return (prob, distmu, distsigma, distnorm), header
+
+
 def fetch_gwosc_event(gw_id, gwosc_base="https://gwosc.org/eventapi/json"):
     """Look up an event on the GWOSC event API by common name.
 
@@ -160,7 +179,7 @@ class Teglon:
 
     def extract_tiles(self, gw_id, healpix_dir='./web/events/{GWID}', healpix_file="bayestar.fits.gz", tele="a", band="r",
                       extinct=0.5, prob_type="4D", cum_prob=0.9, num_tiles=1000, min_ra=-1.0, max_ra=-1.0, max_dec=-1.0,
-                      min_dec=-1.0):
+                      min_dec=-1.0, exclude_observed=True, exclude_planned=False):
 
         t1 = time.time()
 
@@ -318,7 +337,7 @@ class Teglon:
                 {where_filter}
             ORDER BY 
                 running_tile_prob.net_prob DESC 
-            LIMIT 1,{num_tiles};
+            LIMIT {num_tiles};
         '''
 
         aggregate_tile_4D_cte = '''
@@ -337,6 +356,7 @@ class Teglon:
                 JOIN SkyPixel_EBV sp_ebv on sp_ebv.N128_SkyPixel_id = st.N128_SkyPixel_id 
                 JOIN Detector d on d.id = st.Detector_id 
                 WHERE d.id = {detector_id} and hp.HealpixMap_id = {healpix_map_id} 
+                {observed_filter}
                 GROUP BY 
                     st.id, 
                     st.Detector_id, 
@@ -360,6 +380,7 @@ class Teglon:
                 JOIN SkyPixel_EBV sp_ebv on sp_ebv.N128_SkyPixel_id = st.N128_SkyPixel_id 
                 JOIN Detector d on d.id = st.Detector_id 
                 WHERE d.id = {detector_id} and hp.HealpixMap_id = {healpix_map_id} 
+                {observed_filter}
                 GROUP BY 
                     st.id, 
                     st.Detector_id, 
@@ -405,7 +426,7 @@ class Teglon:
             WHERE 
                 {where_filter}
             ORDER BY hp_g_w.GalaxyProb DESC
-            LIMIT 1,{num_tiles};
+            LIMIT {num_tiles};
         '''
 
         galaxies_where_filter = '''
@@ -414,7 +435,35 @@ class Teglon:
             sp_ebv.EBV*{f99_coefficient} <= {extinct} AND 
             g._Dec BETWEEN {min_dec} AND {max_dec} 
             {box_addendum}
+            {observed_filter}
         '''
+
+        # Drop map pixels already covered by an ingested pointing (ObservedTile_HealpixPixel, e.g. from
+        # Treasure Map) so the ranking and cumulative prob only count un-imaged sky. `{pixel_id_col}` is the
+        # HealpixPixel id column of the query it's spliced into. Planned Treasure Map pointings (other groups'
+        # plans) only count when `exclude_planned` is set.
+        observed_pixel_filter = '''
+            AND NOT EXISTS (
+                SELECT 1 FROM ObservedTile_HealpixPixel ot_hp 
+                JOIN ObservedTile ot on ot.id = ot_hp.ObservedTile_id 
+                WHERE ot_hp.HealpixPixel_id = {pixel_id_col} AND ot_hp.HealpixMap_id = {healpix_map_id} 
+                {source_filter}
+            )
+        '''
+
+        observed_pixel_summary_select = '''
+            SELECT COUNT(*), COALESCE(SUM(hp.Prob), 0.0) 
+            FROM HealpixPixel hp 
+            WHERE hp.id IN (
+                SELECT DISTINCT ot_hp.HealpixPixel_id 
+                FROM ObservedTile_HealpixPixel ot_hp 
+                JOIN ObservedTile ot on ot.id = ot_hp.ObservedTile_id 
+                WHERE ot_hp.HealpixMap_id = {healpix_map_id} 
+                {source_filter}
+            )
+        '''
+
+        planned_source_filter = "AND (ot.Source IS NULL OR ot.Source <> 'TreasureMap-planned')"
 
         galaxies_box_addendum = '''
             AND g.RA BETWEEN {min_ra} AND {max_ra}
@@ -424,11 +473,29 @@ class Teglon:
         healpix_map_id = int(query_db([healpix_map_select % (gw_id, healpix_file)])[0][0][0])
 
         # region Query Builder
+        tile_observed_filter = ""
+        galaxy_observed_filter = ""
+        if exclude_observed:
+            source_filter = "" if exclude_planned else planned_source_filter
+            tile_observed_filter = observed_pixel_filter.format(pixel_id_col="st_hp.HealpixPixel_id",
+                                                                healpix_map_id=healpix_map_id,
+                                                                source_filter=source_filter)
+            galaxy_observed_filter = observed_pixel_filter.format(pixel_id_col="hp_g_w.HealpixPixel_id",
+                                                                  healpix_map_id=healpix_map_id,
+                                                                  source_filter=source_filter)
+
+            observed_summary = query_db([observed_pixel_summary_select.format(healpix_map_id=healpix_map_id,
+                                                                              source_filter=source_filter)])[0][0]
+            _print("Excluding %s already-%s map pixels (2D prob: %0.4f)" %
+                   (int(observed_summary[0]), "imaged/planned" if exclude_planned else "imaged",
+                    float(observed_summary[1])))
+
         tile_where = tile_where_filter.format(box_addendum="", cum_prob=cum_prob,
                                               f99_coefficient="{f99_coefficient}", extinct="{extinct}")
         galaxy_where = galaxies_where_filter.format(box_addendum="", f99_coefficient="{f99_coefficient}",
                                                     healpix_map_id=healpix_map_id, extinct="{extinct}",
-                                                    min_dec="{min_dec}", max_dec="{max_dec}")
+                                                    min_dec="{min_dec}", max_dec="{max_dec}",
+                                                    observed_filter=galaxy_observed_filter)
         if is_box_query:
             tile_box = tile_box_addendum.format(min_ra=min_ra, max_ra=max_ra,
                                                 min_dec=min_dec, max_dec=max_dec)
@@ -438,11 +505,14 @@ class Teglon:
             galaxy_box = galaxies_box_addendum.format(min_ra=min_ra, max_ra=max_ra)
             galaxy_where = galaxies_where_filter.format(box_addendum=galaxy_box, f99_coefficient="{f99_coefficient}",
                                                         healpix_map_id=healpix_map_id, extinct="{extinct}",
-                                                        min_dec=min_dec, max_dec=max_dec)
+                                                        min_dec=min_dec, max_dec=max_dec,
+                                                        observed_filter=galaxy_observed_filter)
 
-        tile_aggregate = aggregate_tile_4D_cte.format(detector_id="{detector_id}", healpix_map_id=healpix_map_id)
+        tile_aggregate = aggregate_tile_4D_cte.format(detector_id="{detector_id}", healpix_map_id=healpix_map_id,
+                                                      observed_filter=tile_observed_filter)
         if prob_type == "2D":
-            tile_aggregate = aggregate_tile_2D_cte.format(detector_id="{detector_id}", healpix_map_id=healpix_map_id)
+            tile_aggregate = aggregate_tile_2D_cte.format(detector_id="{detector_id}", healpix_map_id=healpix_map_id,
+                                                          observed_filter=tile_observed_filter)
 
         queries_to_execute = {}
         if extract_all:
@@ -534,6 +604,9 @@ class Teglon:
         box_query_addendum = ""
         if is_box_query:
             box_query_addendum = "_box"
+        if exclude_observed and exclude_planned:
+            # Separate file so it doesn't overwrite the completed-only tiles.
+            box_query_addendum += "_exclplanned"
         for (detector_name, band_name, band_F99), query in queries_to_execute.items():
             query_results = query_db([query])[0]
             file_output = output_file_formatter.format(working_dir=formatted_healpix_dir, gw_id=gw_id,
@@ -546,11 +619,18 @@ class Teglon:
 
             output_table = Table(dtype=dtype, names=cols)
 
+            # Prob = the field's own probability; Percentile = cumulative probability down the ranked list.
+            # Tile rows: (id, FieldName, RA, Dec, net_prob, EBV, A_lambda, mean_dist, cum_prob).
+            # NICKEL galaxy rows: (id, FieldName, RA, Dec, GalaxyProb, EBV, A_lambda, z_dist, B, K) -- no
+            # cumulative column, so it's summed here (rows come ranked by GalaxyProb).
+            running_galaxy_prob = 0.0
             for qr in query_results:
-                row_to_add = [qr[1], qr[2], qr[3], qr[8], qr[4], qr[5], qr[6], qr[7], None, None]
                 if detector_name == "NICKEL":
-                    row_to_add[-2] = qr[8]
-                    row_to_add[-1] = qr[9]
+                    running_galaxy_prob += float(qr[4])
+                    row_to_add = [qr[1], qr[2], qr[3], qr[4], running_galaxy_prob, qr[5], qr[6], qr[7],
+                                  qr[8], qr[9]]
+                else:
+                    row_to_add = [qr[1], qr[2], qr[3], qr[4], qr[8], qr[5], qr[6], qr[7], None, None]
                 output_table.add_row(row_to_add)
 
             hdul = fits.open(healpix_file_path)
@@ -576,6 +656,8 @@ class Teglon:
             comments["MAX_RA"] = max_ra
             comments["MIN_DEC"] = min_dec
             comments["MAX_DEC"] = max_dec
+            comments["EXCLUDE_OBSERVED"] = exclude_observed
+            comments["EXCLUDE_PLANNED"] = exclude_observed and exclude_planned
             s = ""
             for arg in sys.argv:
                 s = s + arg + " "
@@ -890,8 +972,10 @@ class Teglon:
             "SWOPE": EarthLocation(lat=-29.0182 * u.deg, lon=-70.6926 * u.deg, height=2402 * u.m),
             "THACHER": EarthLocation(lat=34.46479 * u.deg, lon=-121.6431 * u.deg, height=630.0 * u.m),
             "NICKEL": EarthLocation(lat=37.3414 * u.deg, lon=-121.6429 * u.deg, height=1283 * u.m),
-            "T80S_T80S-Cam": EarthLocation(lat=-70.8035 * u.deg, lon=-70.8035 * u.deg, height=2207.0 * u.m),
-            "NEWFIRM": EarthLocation(lat=-30.16967 * u.deg, lon=70.80653 * u.deg, height=2207.0 * u.m),
+            # Both at Cerro Tololo (CTIO); west longitudes are negative. T80S previously had its longitude in the
+            # latitude slot (-70.8), where the Sun never sets below -18 deg and the Sun contours failed.
+            "T80S_T80S-Cam": EarthLocation(lat=-30.16967 * u.deg, lon=-70.80653 * u.deg, height=2207.0 * u.m),
+            "NEWFIRM": EarthLocation(lat=-30.16967 * u.deg, lon=-70.80653 * u.deg, height=2207.0 * u.m),
         }
     
         band_mapping = {
@@ -938,31 +1022,52 @@ class Teglon:
         if plot_all:
             # get each default tile file for each instrument.
             default_tile_file_formatted = "{GWID}_{TELE_NAME}_4D_0.9_%s.txt" % healpix_file
-    
-            for detect_key, detect_val in detector_mapping.items():
-                if detect_key != "a":
-                    tile_files[detect_val] = "%s/%s" % (formatted_healpix_dir, default_tile_file_formatted.format(
-                        GWID=gw_id, TELE_NAME=detect_val
-                    ))
+
+            # Same detectors `extract_tiles` writes files for: every detector with a static grid, plus NICKEL.
+            tileable_names_select = """
+                SELECT DISTINCT d.Name, (d.TM_id IS NOT NULL) AS has_tm, d.id
+                FROM Detector d JOIN StaticTile st ON st.Detector_id = d.id
+                ORDER BY has_tm DESC, d.id;
+            """
+            all_detector_names = [row[0] for row in query_db([tileable_names_select])[0]]
+            if "NICKEL" not in all_detector_names:
+                all_detector_names.append("NICKEL")
+
+            for detect_val in all_detector_names:
+                detect_file = "%s/%s" % (formatted_healpix_dir, default_tile_file_formatted.format(
+                    GWID=gw_id, TELE_NAME=detect_val
+                ))
+                if os.path.exists(detect_file):
+                    tile_files[detect_val] = detect_file
+
+            if len(tile_files) == 0:
+                _print("No tile files found for %s in `%s`; run `extract` first." % (gw_id, formatted_healpix_dir))
+                return 1
         else:
             tile_files[detector_mapping.get(tele, tele)] = "%s/%s" % (formatted_healpix_dir, tile_file)
-    
+
         # Create canvas
         plot_axes = {}
         ax_list = []
         if plot_all:
-            fig, ((ax1, ax2), (ax3, ax4), (ax5, ax6)) = plt.subplots(3, 2,
-                                                                     subplot_kw={'projection': 'astro hours mollweide'})
+            # One panel per detector plus the 4D summary in the last panel, two columns.
+            n_rows = max(3, int(np.ceil((len(tile_files) + 1) / 2.0)))
+            fig, axes = plt.subplots(n_rows, 2, figsize=(6.4, 1.6 * n_rows),
+                                     subplot_kw={'projection': 'astro hours mollweide'})
             plt.tight_layout()
-    
-            ax_list += [ax1, ax2, ax3, ax4, ax5, ax6]
-    
+
+            ax_list += list(np.ravel(axes))
+
             for i, (detector_name, tile_file) in enumerate(tile_files.items()):
                 _ax = ax_list[i]
                 _ax.grid()
                 _ax.tick_params(axis='both', labelsize=5)
                 plot_axes[detector_name] = _ax
-    
+
+            # Hide panels between the last detector and the summary.
+            for _ax in ax_list[len(tile_files):-1]:
+                _ax.set_visible(False)
+
             ax_list[-1].grid()
             ax_list[-1].tick_params(axis='both', labelsize=5)
         else:
@@ -1346,8 +1451,7 @@ class Teglon:
         if not build_map:
             _print("Skipping build map...")
             _print("\tLoading existing map from disk...")
-            orig_prob, orig_distmu, orig_distsigma, orig_distnorm, header_gen = hp.read_map(hpx_path,
-                                                                                            field=(0, 1, 2, 3), h=True)
+            (orig_prob, orig_distmu, orig_distsigma, orig_distnorm), header_gen = read_skymap(hpx_path)
 
             orig_npix = len(orig_prob)
             _print("\tOriginal number of pix in '%s': %s" % (healpix_file, orig_npix))
@@ -1574,9 +1678,7 @@ class Teglon:
             _print("Unpacking '%s':%s..." % (gw_id, healpix_file))
             t1 = time.time()
 
-            (orig_prob, orig_distmu, orig_distsigma, orig_distnorm), header_gen = hp.read_map(hpx_path,
-                                                                                              field=(0, 1, 2, 3),
-                                                                                              h=True)
+            (orig_prob, orig_distmu, orig_distsigma, orig_distnorm), header_gen = read_skymap(hpx_path)
 
             header = dict(header_gen)
             orig_npix = len(orig_prob)
@@ -2727,15 +2829,25 @@ class Teglon:
 
         # Check if detector is already in the db
         detector_select = '''
-                    SELECT id, LOWER(`Name`)
-                    FROM Detector 
+                    SELECT id, LOWER(`Name`), TM_id
+                    FROM Detector
                     WHERE
-                        LOWER(`Name`) = '%s' OR 
+                        LOWER(`Name`) = '%s' OR
                         LOWER(`Name`)='%s';
                 '''
         existing_detector_result = query_db([detector_select % (instrument_full_name, instrument_nickname)])[0]
         if any(existing_detector_result):
-            _print("\n*****\nDetector: `%s` is already in the database! Exiting...\n****" % instrument_full_name)
+            existing_id, existing_name, existing_tm_id = existing_detector_result[0]
+            if existing_tm_id is None:
+                # A detector from the original setup (e.g. SINISTRO) with the same name: link it to its Treasure
+                # Map id so pointings can be synced to it, keeping its existing geometry.
+                query_db(["UPDATE Detector SET TM_id = %d WHERE id = %d;" % (int(tm_detector_id), int(existing_id))],
+                         commit=True)
+                _print("\n*****\nDetector: `%s` is already in the database (id=%s); linked it to TM id %s.\n****" %
+                       (existing_name, existing_id, tm_detector_id))
+                return 0
+            _print("\n*****\nDetector: `%s` is already in the database (id=%s, TM id %s)! Exiting...\n****" %
+                   (instrument_full_name, existing_id, existing_tm_id))
             return 1
 
         _print("\n*****\nDetector: `%s` is new to Teglon. Adding...\n****" % instrument_full_name)

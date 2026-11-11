@@ -83,6 +83,28 @@ class TestTelescopeGeometry(unittest.TestCase):
             tc.normalize_geometry_args("triangle")
 
 
+class TestGridPrefix(unittest.TestCase):
+    def test_first_letter_when_free(self):
+        self.assertEqual(tc.choose_grid_prefix("ZTF", set()), "Z")
+
+    def test_first_two_letters_when_first_taken(self):
+        self.assertEqual(tc.choose_grid_prefix("WINTER", {"W"}), "WI")
+
+    def test_case_insensitive_and_punctuation_ignored(self):
+        self.assertEqual(tc.choose_grid_prefix("Sinistro", {"s", "SI"}), "SIN")
+        self.assertEqual(tc.choose_grid_prefix("T80S_T80S-Cam", {"T"}), "T80S")
+
+    def test_skips_prefixes_ending_in_a_digit(self):
+        self.assertEqual(tc.choose_grid_prefix("T80S", {"T"}), "T80S")
+
+    def test_all_taken_appends_number(self):
+        self.assertEqual(tc.choose_grid_prefix("AB", {"A", "AB"}), "AB2X")
+
+    def test_prefix_from_field_name(self):
+        self.assertEqual(tc.grid_prefix_from_field_name("T80S000123"), "T80S")
+        self.assertEqual(tc.grid_prefix_from_field_name("Z000000"), "Z")
+
+
 class TestSetupSteps(unittest.TestCase):
     def test_default_three_steps_in_order(self):
         steps = tc.build_setup_steps()

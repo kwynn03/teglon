@@ -9,12 +9,13 @@ import astropy.coordinates as coord
 
 from dustmaps.config import config
 import dustmaps.sfd
+from web.src.utilities.fetch_sfd import fetch_sfd
 
 from web.src.objects.Pixel_Element import *
 
 utilities_base_dir = "/app/web/src/utilities"
 config["data_dir"] = "/dustmaps"
-dustmaps.sfd.fetch()
+fetch_sfd(config["data_dir"])
 
 nside128 = 128
 
